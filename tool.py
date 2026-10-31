@@ -1,74 +1,50 @@
-"""Offline analysis; consumes normalized JSON, never connects to infrastructure."""
+"""Resolve VM Multus attachments against live NADs and optionally change one stopped VM attachment."""
 import argparse
-import ipaddress
+from decimal import Decimal
 import json
-import math
-from pathlib import Path
 import sys
+import subprocess
+from datetime import datetime, timezone
+from oc_client import Client, VM, VMI, MIG, SNAP, quantity, age_hours, condition, require_name, stopped, escape, migration
 
 
-def positive(value):
-    if value <= 0:
-        raise ValueError('Expected a positive value')
-    return value
-
-
-def integer_positive(value):
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError('Expected a positive integer')
-    return positive(value)
-
-
-def validate(value, schema, path='input'):
-    """Validate required fields and primitive types; allow extra keys."""
-    if isinstance(schema, dict):
-        if not isinstance(value, dict): raise ValueError(path + ': expected object')
-        for key, child in schema.items():
-            if key not in value: raise ValueError(path + ': missing ' + key)
-            validate(value[key], child, path + '.' + key)
-    elif isinstance(schema, list):
-        if not isinstance(value, list): raise ValueError(path + ': expected list')
-        if schema:
-            for index, item in enumerate(value): validate(item, schema[0], path + '[' + str(index) + ']')
-    elif isinstance(schema, bool):
-        if not isinstance(value, bool): raise ValueError(path + ': expected boolean')
-    elif isinstance(schema, (int, float)):
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-            raise ValueError(path + ': expected finite number')
-        if isinstance(schema, int) and not isinstance(value, int): raise ValueError(path + ': expected integer')
-        if schema >= 0 and value < 0: raise ValueError(path + ': expected nonnegative number')
-    elif not isinstance(value, str):
-        raise ValueError(path + ': expected string')
-
-
-def analyze(data):
-    validate(data, SCHEMA)
-    return _analyze(data)
+def execute(client,args):
+    vm = client.get(VM, require_name(args))
+    networks = vm['spec']['template']['spec'].get('networks', [])
+    if args.nad:
+        if not args.network: raise ValueError('--network is required with --nad')
+        stopped(client, args.name)
+        namespace, name = args.nad.split('/',1) if '/' in args.nad else (args.namespace,args.nad)
+        Client(args.context,namespace).get('network-attachment-definitions.k8s.cni.cncf.io',name)
+        index = next((index for index,item in enumerate(networks) if item['name'] == args.network and 'multus' in item), None)
+        if index is None: raise ValueError('Named Multus network is absent from this VM')
+        return client.patch(VM,vm,[{'op':'replace','path':f'/spec/template/spec/networks/{index}/multus/networkName','value':args.nad}],args.apply)
+    rows = []
+    for network in networks:
+        if 'multus' not in network: continue
+        reference = network['multus']['networkName']
+        namespace,name = reference.split('/',1) if '/' in reference else (args.namespace,reference)
+        nad = Client(args.context,namespace).get('network-attachment-definitions.k8s.cni.cncf.io',name,missing_ok=True)
+        rows.append({'network':network['name'],'nad':namespace+'/'+name,'exists':bool(nad)})
+    return rows
 
 
 def main():
-    parser = argparse.ArgumentParser(description=DESCRIPTION)
-    parser.add_argument('input', type=Path, help='Normalized JSON file; see examples/sample.json')
+    parser = argparse.ArgumentParser(description='Resolve VM Multus attachments against live NADs and optionally change one stopped VM attachment.')
+    parser.add_argument('--context',required=True,help='Explicit existing oc kubeconfig context')
+    parser.add_argument('--namespace',required=True,help='Namespace for workload operations')
+    parser.add_argument('--name',help='Exact workload/resource name where required')
+    parser.add_argument('--apply',action='store_true',help='Execute the requested change; default is preview')
+    parser.add_argument('--network', help='VM network alias to change')
+    parser.add_argument('--nad', help='Existing namespace/name NetworkAttachmentDefinition')
     args = parser.parse_args()
     try:
-        with args.input.open(encoding='utf-8-sig') as stream:
-            data = json.load(stream)
-        print(json.dumps(analyze(data), indent=2, sort_keys=True, allow_nan=False))
-    except (OSError, ValueError, TypeError, KeyError) as error:
-        print('Input error: ' + str(error), file=sys.stderr)
+        result = execute(Client(args.context,args.namespace),args)
+        print(json.dumps({'context':args.context,'namespace':args.namespace,'collected_at':datetime.now(timezone.utc).isoformat(),'result':result},indent=2))
+    except (RuntimeError,ValueError,KeyError,OSError,TimeoutError,subprocess.SubprocessError) as error:
+        print(str(error),file=sys.stderr)
         return 2
     return 0
 
 
-SCHEMA = {'available_networks': ['apps/production'], 'vms': [{'name': 'web-01', 'networks': ['apps/production']}]}
-DESCRIPTION = 'Find VM network attachment names missing from a target namespace catalog.'
-
-def _analyze(data):
-    missing = []
-    for vm in data['vms']:
-        for network in vm['networks']:
-            if network not in data['available_networks']: missing.append({'vm':vm['name'], 'network':network})
-    return {'missing':missing, 'mapped':not missing}
-
-if __name__ == '__main__':
-    raise SystemExit(main())
+if __name__ == '__main__': raise SystemExit(main())
