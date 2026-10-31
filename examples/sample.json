@@ -1,0 +1,13 @@
+{
+  "available_networks": [
+    "apps/production"
+  ],
+  "vms": [
+    {
+      "name": "web-01",
+      "networks": [
+        "apps/production"
+      ]
+    }
+  ]
+}
